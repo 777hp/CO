@@ -88,6 +88,8 @@ parser.add_argument('--router_times_scale', type=int, default=1,help='Scaling fa
 parser.add_argument('--ai_model', type=str, default="vit",help='AI models:vit, gcn, resnet50, resnet110, vgg16, densenet121, test, roofline')
 parser.add_argument('--thermal', action='store_true', help='Run thermal simulation or not')
 parser.add_argument('--N_stack', type=int, default=1,help='Number of 3D stacks in 3.5D design')
+parser.add_argument('--tile_area_mode', type=str, default='legacy_last', choices=['legacy_last','hardware_only'], help='Tile area reporting mode')
+parser.add_argument('--leakage_mode', type=str, default='active_only', choices=['active_only','installed'], help='Leakage reporting mode')
 
 
 #Take all below parameters as argument
@@ -97,6 +99,8 @@ xbar_size = args.xbar_size # 64,128,256,512,1024
 N_tile=args.N_tile # 4,9,16,25,36,49 # how many tile in tier (chiplet)
 N_tier=args.N_tier # 2,3,4,5,6,7,8,9,10 
 N_stack=args.N_stack #1, 2,3,4,5,6,7,8,9,10 
+tile_area_mode=args.tile_area_mode
+leakage_mode=args.leakage_mode
 N_pe=args.N_pe # 4,9,16,25 # how many PE in tile
 N_crossbar=args.N_crossbar # 4, 9, 16 # how many crossbar in PE
 quant_weight=args.quant_weight # weight quantization bi
@@ -111,6 +115,7 @@ if args.compute_validate:
     COMPUTE_VALIDATE = True
 else:
     COMPUTE_VALIDATE = False
+print(f"Compute reporting modes: tile_area_mode={tile_area_mode}, leakage_mode={leakage_mode}")
 placement_method=args.placement_method  # 1: Tier/Chiplet Edge to Tier/Chiplet Edge connection 
                                         # 2: from the bottom to top tier1
                                         # 3: the hotspot far from each other
@@ -205,7 +210,7 @@ result_list.append(N_stack_real)
 #     Computing: generate PPA for IMC/GPU/CPU/ASIC computing units    #
 #                                                                     #
 #---------------------------------------------------------------------#
-N_tier_real,computing_data,area_single_tile,volt,total_model_L,result_list,out_peripherial,A_peri=compute_IMC_model(COMPUTE_VALIDATE,xbar_size,volt, freq_computing,quant_act,quant_weight,N_crossbar,N_pe,N_tier_real,N_stack_real, N_tile,result_list,result_dictionary, network_params, relu)
+N_tier_real,computing_data,area_single_tile,volt,total_model_L,result_list,out_peripherial,A_peri=compute_IMC_model(COMPUTE_VALIDATE,xbar_size,volt, freq_computing,quant_act,quant_weight,N_crossbar,N_pe,N_tier_real,N_stack_real, N_tile,result_list,result_dictionary, network_params, relu, tile_area_mode=tile_area_mode, leakage_mode=leakage_mode)
 end_computing = time.time()
 print("Computing model sim time is:", (end_computing - start),"s")
 print("--------------------------------------------------------")
