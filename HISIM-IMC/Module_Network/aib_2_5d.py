@@ -97,7 +97,7 @@ tx_4x_fifo= params["tx_4x_fifo"]
 tx_4x_io= params["tx_4x_io"]
 
 
-def aib(Q, Len_chip, mode, volt):
+def aib(Q, Len_chip, mode, volt, wire_len_mm=None, wire_latency_ns=None):
     #Q: data volume is in MegaBytes
 
     #AIB Tx area, energy and latency (40Tx, 0Rx)
@@ -105,7 +105,7 @@ def aib(Q, Len_chip, mode, volt):
     latency_Tx, energy_Tx,energy_eff_Tx =performance_aib(volt,n_Tx_config*2, 0)
     
     #area, energy, power and latency of wire interface connecting AIB modules of two chiplets
-    A_wire, L_wire,E_wire, P_wire = area_performance_wire(n_Tx_config*2, 0)
+    A_wire, L_wire,E_wire, P_wire = area_performance_wire(n_Tx_config*2, 0, wire_len_mm=wire_len_mm, wire_latency_ns=wire_latency_ns)
 
     #AIB Rx area, energy and latency(0Tx, 40Rx)
     area_Rx, BW =area_aib(Len_chip, mode, 0, n_Rx_config*2)
@@ -195,15 +195,23 @@ def performance_aib(volt, n_Tx, n_Rx):
 
     return latency, energy, adapt_energy_eff
 
-def area_performance_wire(n_Tx, n_Rx):
+def area_performance_wire(n_Tx, n_Rx, wire_len_mm=None, wire_latency_ns=None):
+    eff_len_mm = Len_wire if wire_len_mm is None else wire_len_mm
+    len_scale = eff_len_mm / Len_wire if Len_wire != 0 else 1.0
+
     #Area encompassing the wire interface in mm2
-    A_wire= (p_rw/(2*n_IOcl)*n_IO+W_wire)*Len_wire*1e-3     
+    A_wire= (p_rw/(2*n_IOcl)*n_IO+W_wire)*eff_len_mm*1e-3
     A_wire*=n_ch
 
-    L_wire= 0.69*(R_on*C_in+(R_on+R_wire/2)*Cg_wire+(R_on+R_wire)*C_out)*1e-3 #Latency of the wire interface in ns
+    if wire_latency_ns is None:
+        Cg_wire_eff = Cg_wire * len_scale
+        L_wire= 0.69*(R_on*C_in+(R_on+R_wire/2)*Cg_wire_eff+(R_on+R_wire)*C_out)*1e-3 #Latency of the wire interface in ns
+    else:
+        L_wire = float(wire_latency_ns)
 
     #Power of wire interface in mW
-    P_wire= (alpha_aib*aib_ns_fwd_clk+ alpha_aib*aib_fs_fwd_clk+alpha_in*aib_fs_fwd_clk*n_Rx+alpha_in*aib_fs_fwd_clk*n_Tx)*(Cg_wire)*aib_Volt**2 
+    Cg_wire_eff = Cg_wire * len_scale
+    P_wire= (alpha_aib*aib_ns_fwd_clk+ alpha_aib*aib_fs_fwd_clk+alpha_in*aib_fs_fwd_clk*n_Rx+alpha_in*aib_fs_fwd_clk*n_Tx)*(Cg_wire_eff)*aib_Volt**2
     P_wire*=n_ch
 
     return A_wire, L_wire, P_wire*L_wire, P_wire
