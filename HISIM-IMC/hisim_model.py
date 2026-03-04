@@ -47,8 +47,8 @@ import csv
 import time
 import argparse
 import sys
+import json
 from Module_Compute.functions import imc_analy
-from Module_Thermal.thermal_model import thermal_model
 from Module_Network.network_model import network_model
 from Module_Compute.compute_IMC_model import compute_IMC_model
 from Module_AI_Map.util_chip.util_mapping import model_mapping, load_ai_network,smallest_square_greater_than
@@ -58,13 +58,37 @@ import pandas as pd
 
 if not os.path.exists('./Debug/to_interconnect_analy'):
     os.makedirs('./Debug/to_interconnect_analy')
-if not os.path.exists('./Results/result_thermal'):
-    os.makedirs('./Results/result_thermal')
-if os.path.exists('./Results/result_thermal/1stacks'):
-    shutil.rmtree('.//Results/result_thermal/1stacks')
 if not os.path.exists('./Results'):
     os.makedirs('./Results')
-os.makedirs('.//Results/result_thermal/1stacks')
+
+
+def _validate_area_feasibility(n_core_by_stack, chiplet_floorplan, area_single_core_mm2, packing_efficiency=0.85, area_violation_policy='error'):
+    chiplets_cfg = chiplet_floorplan.get('chiplets', []) if chiplet_floorplan else []
+    by_stack = {int(c['stack_id']): c for c in chiplets_cfg}
+    adjusted = list(n_core_by_stack)
+    stack_reports = []
+    for stack_id, n_core in enumerate(n_core_by_stack):
+        if stack_id not in by_stack:
+            continue
+        chip = by_stack[stack_id]
+        a_defined = float(chip['w']) * float(chip['h'])
+        a_required = float(n_core) * area_single_core_mm2
+        max_core = int((a_defined * packing_efficiency) // area_single_core_mm2) if area_single_core_mm2 > 0 else n_core
+        stack_reports.append({'stack_id': stack_id, 'A_defined': a_defined, 'A_required': a_required, 'max_n_core': max_core})
+        if a_required > a_defined * packing_efficiency:
+            msg = (
+                f"Area infeasible for stack_id={stack_id}: "
+                f"A_defined={a_defined:.6f} mm2, A_required={a_required:.6f} mm2, "
+                f"max_n_core={max_core} with packing_efficiency={packing_efficiency}"
+            )
+            if area_violation_policy == 'error':
+                raise ValueError(msg)
+            if area_violation_policy == 'clip':
+                adjusted[stack_id] = max_core
+            else:
+                raise ValueError(f"Unsupported area_violation_policy={area_violation_policy}")
+    return adjusted, stack_reports
+
 
 class HiSimModel:
 
@@ -91,9 +115,14 @@ class HiSimModel:
         W2d = 32,               # int    | number of links of 2D NoC                    
         router_times_scale = 1, # int    | scaling factor for time of: trc, tva, tsa, tst, tl, tenq
         ai_model = "vit",       # string | AI model                                     -vit, gcn, resnet50, resnet110, vgg16, densenet121, test, roofline
-        thermal = True,                 # | run thermal simulation
+        thermal = False,                # | run thermal simulation
         N_stack=1,               #int      |Number of 3D stacks in 3.5D design           -1, 2,3,4,5,6,7,8,9,10 
-        ppa_filepath = "./Results/PPA.csv"  
+        ppa_filepath = "./Results/PPA.csv",
+        chiplet_floorplan_path = None,
+        use_rapidchiplet_scheme2 = True,
+        rapidchiplet_module_path = None,
+        packing_efficiency = 0.85,
+        area_violation_policy = "error"
     ):
         if chip_architect == "H2_5D":
             self.placement_method = 1
@@ -131,6 +160,11 @@ class HiSimModel:
         self.ai_model = ai_model
         self.thermal = thermal
         self.filename_results = ppa_filepath
+        self.chiplet_floorplan_path = chiplet_floorplan_path
+        self.use_rapidchiplet_scheme2 = use_rapidchiplet_scheme2
+        self.rapidchiplet_module_path = rapidchiplet_module_path
+        self.packing_efficiency = packing_efficiency
+        self.area_violation_policy = area_violation_policy
         
         self.csv_header = [
                                 'freq_core (GHz)',
@@ -147,6 +181,8 @@ class HiSimModel:
                                 'Computing_energy (pJ)',
                                 'compute_area (um2)',
                                 'chip area (mm2)',
+                                'chiplet_defined_area_mm2',
+                                'core_required_area_mm2',
                                 'chip_Architecture',
     
                                 '2d NoC latency (ns)',
@@ -259,10 +295,62 @@ class HiSimModel:
         self.filename_results = ppa_filepath
 
     def run_model(self):
-        if os.path.exists('./Results/result_thermal/'):
-            shutil.rmtree('./Results/result_thermal/')
-        os.makedirs('./Results/result_thermal/')
-        os.makedirs('./Results/result_thermal/1stacks')
+        if self.thermal:
+            if os.path.exists('./Results/result_thermal/'):
+                shutil.rmtree('./Results/result_thermal/')
+            os.makedirs('./Results/result_thermal/')
+            os.makedirs('./Results/result_thermal/1stacks')
+
+        chiplet_floorplan = None
+        n_tile_for_mapping = self.N_tile
+        n_core_by_stack = None
+        chiplet_defined_area_mm2 = None
+        if self.chiplet_floorplan_path:
+            with open(self.chiplet_floorplan_path, 'r', encoding='utf-8') as floorplan_file:
+                chiplet_floorplan = json.load(floorplan_file)
+
+            # Per-chiplet capacity is only supported for 2.5D (N_tier=1).
+            if self.chip_architect == "H2_5D" and self.N_tier == 1:
+                chiplets_cfg = chiplet_floorplan.get('chiplets', [])
+                if chiplets_cfg:
+                    n_stack_cfg = max(int(c['stack_id']) for c in chiplets_cfg) + 1
+                    n_core_by_stack = [None] * n_stack_cfg
+                    for chip in chiplets_cfg:
+                        sid = int(chip['stack_id'])
+                        if 'n_core' not in chip:
+                            raise ValueError(f"chiplet floorplan missing n_core for stack_id={sid}")
+                        n_core_by_stack[sid] = int(chip['n_core'])
+                    if any(v is None for v in n_core_by_stack):
+                        missing = [idx for idx, v in enumerate(n_core_by_stack) if v is None]
+                        raise ValueError(f"chiplet floorplan missing entries for stack_id={missing}")
+                    n_tile_for_mapping = n_core_by_stack
+
+        if isinstance(n_tile_for_mapping, list):
+            n_core_by_stack = n_tile_for_mapping
+
+        # Feasibility check for floorplan-defined chiplet area versus required core area (2.5D only)
+        if n_core_by_stack is not None and chiplet_floorplan is not None and self.chip_architect == "H2_5D" and self.N_tier == 1:
+            freq_adc = 0.005 if self.compute_validate else self.freq_computing
+            imc_tmp = imc_analy(
+                xbar_size=self.xbar_size,
+                volt=self.volt,
+                freq=self.freq_computing,
+                freq_adc=freq_adc,
+                compute_ref=self.compute_validate,
+                quant_bits=[self.quant_weight, self.quant_act],
+                RELU=self.relu,
+            )
+            area_single_core_mm2 = imc_tmp.area_per_core(self.N_crossbar, self.N_pe)
+            n_core_by_stack, area_reports = _validate_area_feasibility(
+                n_core_by_stack,
+                chiplet_floorplan,
+                area_single_core_mm2,
+                packing_efficiency=self.packing_efficiency,
+                area_violation_policy=self.area_violation_policy,
+            )
+            n_tile_for_mapping = n_core_by_stack
+            chiplet_defined_area_mm2 = sum(float(c['w']) * float(c['h']) for c in chiplet_floorplan.get('chiplets', []))
+            core_required_area_mm2 = sum(n_core_by_stack) * area_single_core_mm2
 
         result_list=[]
 
@@ -285,6 +373,9 @@ class HiSimModel:
 
         result_dictionary['placement_method'] = self.placement_method
         result_dictionary['percent_router'] = self.percent_router
+        if chiplet_defined_area_mm2 is not None and n_core_by_stack is not None:
+            result_dictionary['chiplet_defined_area_mm2'] = chiplet_defined_area_mm2
+            result_dictionary['core_required_area_mm2'] = core_required_area_mm2
 
         print("=========================================start HISIM simulation ========================================= ","\n")
         start = time.time()       
@@ -315,7 +406,7 @@ class HiSimModel:
             self.N_crossbar,
             self.N_pe,
             self.quant_weight,
-            self.N_tile,
+            n_tile_for_mapping,
             self.N_tier,
             self.N_stack)
 
@@ -388,7 +479,9 @@ class HiSimModel:
                                             result_list, 
                                             result_dictionary,
                                             network_params,
-                                            self.relu
+                                            self.relu,
+                                            n_core_by_stack=n_core_by_stack,
+                                            chiplet_defined_area_mm2=chiplet_defined_area_mm2
                                         )
 
         N_tier_real,computing_data,area_single_tile,volt,total_model_L,result_list,out_peripherial,A_peri = compute_results
@@ -422,7 +515,10 @@ class HiSimModel:
                                         self.router_times_scale,
                                         tiles_each_tier, 
                                         self.routing_method, 
-                                        self.W2d
+                                        self.W2d,
+                                        chiplet_floorplan=chiplet_floorplan,
+                                        use_rapidchiplet_scheme2=self.use_rapidchiplet_scheme2,
+                                        rapidchiplet_module_path=self.rapidchiplet_module_path
                                     )
         chiplet_num,tier_2d_hop_list_power,tier_3d_hop_list_power,single_router_area,mesh_edge,layer_aib_list,result_list = network_results
 
@@ -439,6 +535,7 @@ class HiSimModel:
         sim_name="Densenet_placement_1"
         # thermal_model function will start the simulation for generating the temperature results based on the power and area of the different blocks of the chip
         if self.thermal and self.chip_architect!="M3_5D":
+            from Module_Thermal.thermal_model import thermal_model
             print("----------thermal analysis start--------------------")
 
             peak_temp = thermal_model(

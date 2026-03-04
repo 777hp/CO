@@ -176,6 +176,19 @@ class imc_analy():
 
         return A, L, E, peripherials, A_peripherial
 
+    def area_per_core(self, N_crossbar, N_pe):
+        # Hardware-only tile area estimation in mm^2 (independent of AI layers)
+        A_arr_pe = self.A_cell * self.xbar_x * self.xbar_y * N_crossbar
+        A_adc_pe = self.A_adc * self.N_adc * N_crossbar
+        A_shadd_pe = self.A_shiftadd * self.ADC_factor * self.Qadc / self.Qw * N_crossbar
+        A_accum_pe = self.A_accum * (self.xbar_y / self.Qw) * N_crossbar / 12 / 16
+        A_buffer_pe = self.A_buffer * N_crossbar
+        A_control_pe = self.A_control * self.N_adc / 16 + self.A_matrix * self.xbar_y / 128
+        A_pe = A_arr_pe + A_adc_pe + A_shadd_pe + A_accum_pe + A_buffer_pe + A_control_pe
+
+        A_tile = A_pe * N_pe + self.A_accum * math.sqrt(N_pe) / 2 * self.xbar_y / 64
+        return A_tile
+
     def leakage(self,N_crossbar,N_pe):
         
         leak_single_xbar=4e-7*self.xbar_y+3e-7

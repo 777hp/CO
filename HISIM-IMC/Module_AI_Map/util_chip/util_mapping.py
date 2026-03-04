@@ -139,10 +139,17 @@ class util_map():
         self.tiles_cumm_stack=0
         self.cumm_layer_stack=0
     
+    def cap(self, stack_idx):
+        if isinstance(self.N_tile, int):
+            return self.N_tile
+        if stack_idx < 0 or stack_idx >= len(self.N_tile):
+            raise ValueError(f"N_tile list does not provide capacity for stack_idx={stack_idx}")
+        return self.N_tile[stack_idx]
+
     def forward(self, layer_num_tile, layer_idx):
 
         #Check if the required number of tiles for this layer are greater than the user-defined number of tiles in a tier/chiplet
-        if layer_num_tile>self.N_tile:
+        if layer_num_tile>self.cap(self.stack_index):
             print("Alert!!!","layer",layer_idx,"mapped to multiple chiplet/tier")
             print("please increase crossbar size, PE number, or tile number")
             # sys.exit()
@@ -165,14 +172,14 @@ class util_map():
             while True:
                 if self.tier_index==0:
                     break
-                elif self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile>self.N_tile:
+                elif self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile>self.cap(self.stack_index):
                 #print(self.tier_index)
                     self.tier_index-=1
                 else:
                     break
-            #print(self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile>self.N_tile, self.tiles_each_tier, self.N_tile, layer_num_tile)
+            #print(self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile>self.cap(self.stack_index), self.tiles_each_tier, self.N_tile, layer_num_tile)
             #Check if the number of tiles of a layer cannot fit on the remaining tiles on the corresponding tier/chiplet
-            if self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile>self.N_tile:
+            if self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile>self.cap(self.stack_index):
                 self.tiles_cumm_stack+=self.tiles_each_stack[self.stack_index]
                 self.cumm_layer_stack=layer_idx
                 if self.stack_index<self.N_stack-1:
@@ -195,8 +202,8 @@ class util_map():
             #Placement method 1: Tier/Chiplet Edge to Tier/Chiplet Edge connection
             total_tiles_required_layer=layer_num_tile
             #Map top tier/chiplet completely before proceeding to next tier/chiplet 
-            if self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile>self.N_tile:
-                total_tiles_required_layer=self.N_tile-self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile              #Count the total number of tiles required uptil this layer
+            if self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile>self.cap(self.stack_index):
+                total_tiles_required_layer=self.cap(self.stack_index)-self.tiles_each_tier[self.stack_index][self.tier_index]+layer_num_tile              #Count the total number of tiles required uptil this layer
                 if self.tier_index==self.N_tier-1:
                     self.stack_index+=1
                     self.tiles_each_stack.append(0)

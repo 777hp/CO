@@ -9,6 +9,8 @@
 
 
 # HISIM_V1.1
+
+> 新增：面向 per-chiplet capacity / floorplan / 2.5D scheme2 的使用手册请见 `README_per_chiplet_sim.md`。
 HISIM introduces a suite of analytical models at the system level to speed up performance prediction for AI models, covering logic-on-logic architectures across 2D, 2.5D, 3D and 3.5D integration.
 
 ![HISIM Overview](https://github.com/pragnyan948/HISIM/blob/main/HISIM-IMC/HISIM_Overview.png "HISIM Overview")
