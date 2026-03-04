@@ -1,12 +1,195 @@
 import math
 import numpy as np
+import sys
 from Module_Network.orion_power_area import power_summary_router
 from Module_Network.aib_2_5d import aib
 import matplotlib.pyplot as plt
 from Module_AI_Map.util_chip.util_mapping import create_tile
 
+
+
+def _default_ports(chiplet):
+    w = chiplet["w"]
+    h = chiplet["h"]
+    return {
+        "east": {"x": w, "y": h / 2.0},
+        "west": {"x": 0.0, "y": h / 2.0},
+        "north": {"x": w / 2.0, "y": h},
+        "south": {"x": w / 2.0, "y": 0.0},
+    }
+
+
+def _validate_and_normalize_floorplan(chiplet_floorplan, n_stack_real):
+    floorplan = dict(chiplet_floorplan)
+    floorplan.setdefault("link_routing", "manhattan")
+    packaging = dict(floorplan.get("packaging") or {})
+    packaging.setdefault("link_latency_type", "function")
+    packaging.setdefault("link_latency", "lambda L: 0.0*L")
+    floorplan["packaging"] = packaging
+
+    chiplets = floorplan.get("chiplets") or []
+    chiplet_by_stack = {}
+    seen = set()
+    for chip in chiplets:
+        sid = int(chip["stack_id"])
+        if sid in seen:
+            raise ValueError(f"Duplicate stack_id in floorplan: {sid}")
+        seen.add(sid)
+        if sid < 0 or sid >= n_stack_real:
+            raise ValueError(f"stack_id out of range in floorplan: {sid}")
+        norm = {
+            "stack_id": sid,
+            "x": float(chip["x"]),
+            "y": float(chip["y"]),
+            "w": float(chip["w"]),
+            "h": float(chip["h"]),
+            "rotation": int(chip.get("rotation", 0)),
+        }
+        ports = _default_ports(norm)
+        if "aib_ports" in chip and chip["aib_ports"] is not None:
+            for pname, pval in chip["aib_ports"].items():
+                px = float(pval["x"])
+                py = float(pval["y"])
+                if not (0.0 <= px <= norm["w"] and 0.0 <= py <= norm["h"]):
+                    raise ValueError(f"aib_ports.{pname} out of range for stack {sid}")
+                ports[pname] = {"x": px, "y": py}
+        norm["aib_ports"] = ports
+        chiplet_by_stack[sid] = norm
+
+    expected = set(range(n_stack_real))
+    if set(chiplet_by_stack.keys()) != expected:
+        missing = sorted(expected - set(chiplet_by_stack.keys()))
+        extra = sorted(set(chiplet_by_stack.keys()) - expected)
+        raise ValueError(f"floorplan stack_id coverage mismatch, missing={missing}, extra={extra}")
+    floorplan["chiplet_by_stack"] = chiplet_by_stack
+    return floorplan
+
+
+def _select_ports(src_chip, dst_chip):
+    src_center = (src_chip["x"] + src_chip["w"] / 2.0, src_chip["y"] + src_chip["h"] / 2.0)
+    dst_center = (dst_chip["x"] + dst_chip["w"] / 2.0, dst_chip["y"] + dst_chip["h"] / 2.0)
+    dx = dst_center[0] - src_center[0]
+    dy = dst_center[1] - src_center[1]
+    if abs(dx) >= abs(dy):
+        if dx >= 0:
+            return "east", "west"
+        return "west", "east"
+    if dy >= 0:
+        return "north", "south"
+    return "south", "north"
+
+
+def _edge_len_for_port(chip, port_name):
+    if port_name in ["east", "west"]:
+        return chip["h"]
+    return chip["w"]
+
+
+def _wire_latency_ns(packaging, wire_len_mm):
+    latency_type = packaging.get("link_latency_type", "function")
+    latency_cfg = packaging.get("link_latency", "lambda L: 0.0*L")
+    if latency_type == "constant":
+        return float(latency_cfg)
+    return float(eval(latency_cfg)(wire_len_mm))
+
+
+def compute_2p5d_aib_from_floorplan_and_transfers(transfers, chiplet_floorplan, volt, rapidchiplet_module_path=None):
+    floorplan = _validate_and_normalize_floorplan(chiplet_floorplan, len(chiplet_floorplan.get("chiplets", [])))
+    chiplet_by_stack = floorplan["chiplet_by_stack"]
+    sorted_stacks = sorted(chiplet_by_stack.keys())
+    stack_to_outer = {sid: idx for idx, sid in enumerate(sorted_stacks)}
+    port_to_idx = {"east": 0, "west": 1, "north": 2, "south": 3}
+
+    placement = {"chiplets": []}
+    chiplets = {}
+    for sid in sorted_stacks:
+        chip = chiplet_by_stack[sid]
+        placement["chiplets"].append({
+            "name": f"chiplet{sid}",
+            "position": {"x": chip["x"], "y": chip["y"]},
+            "rotation": chip.get("rotation", 0),
+        })
+        chiplets[f"chiplet{sid}"] = {
+            "dimensions": {"x": chip["w"], "y": chip["h"]},
+            "phys": [
+                {"x": chip["aib_ports"]["east"]["x"], "y": chip["aib_ports"]["east"]["y"]},
+                {"x": chip["aib_ports"]["west"]["x"], "y": chip["aib_ports"]["west"]["y"]},
+                {"x": chip["aib_ports"]["north"]["x"], "y": chip["aib_ports"]["north"]["y"]},
+                {"x": chip["aib_ports"]["south"]["x"], "y": chip["aib_ports"]["south"]["y"]},
+            ],
+        }
+
+    topology = []
+    distinct_pairs = []
+    seen = set()
+    pair_port_map = {}
+    for src, dst, _ in transfers:
+        if (src, dst) in seen:
+            continue
+        seen.add((src, dst))
+        src_chip = chiplet_by_stack[src]
+        dst_chip = chiplet_by_stack[dst]
+        src_port, dst_port = _select_ports(src_chip, dst_chip)
+        pair_port_map[(src, dst)] = (src_port, dst_port)
+        topology.append({
+            "ep1": {"type": "chiplet", "outer_id": stack_to_outer[src], "inner_id": port_to_idx[src_port]},
+            "ep2": {"type": "chiplet", "outer_id": stack_to_outer[dst], "inner_id": port_to_idx[dst_port]},
+        })
+        distinct_pairs.append((src, dst))
+
+    packaging = {"link_routing": floorplan.get("link_routing", "manhattan")}
+    inputs = {"design": {}, "chiplets": chiplets, "packaging": packaging, "placement": placement, "topology": topology}
+
+    try:
+        import rapidchiplet
+    except ImportError:
+        if rapidchiplet_module_path is None:
+            raise ImportError("Unable to import rapidchiplet. Please provide rapidchiplet_module_path.")
+        if rapidchiplet_module_path not in sys.path:
+            sys.path.append(rapidchiplet_module_path)
+        import rapidchiplet
+
+    link_lengths = rapidchiplet.compute_link_lengths(inputs, {})
+    details = []
+    area_total = 0.0
+    energy_total = 0.0
+    latency_total = 0.0
+    packaging_cfg = floorplan["packaging"]
+
+    for src, dst, q_bits in transfers:
+        src_outer = stack_to_outer[src]
+        dst_outer = stack_to_outer[dst]
+        wire_len_mm = float(link_lengths[(("chiplet", src_outer), ("chiplet", dst_outer))])
+        wire_latency_ns = _wire_latency_ns(packaging_cfg, wire_len_mm)
+        src_port, dst_port = pair_port_map[(src, dst)]
+        src_chip = chiplet_by_stack[src]
+        dst_chip = chiplet_by_stack[dst]
+        len_chip = min(_edge_len_for_port(src_chip, src_port), _edge_len_for_port(dst_chip, dst_port))
+        q_mb = q_bits * 1e-6 / 8
+        layer_aib = aib(q_mb, len_chip, 1, volt, wire_len_mm=wire_len_mm, wire_latency_ns=wire_latency_ns)
+        area_total += layer_aib[0]
+        energy_total += layer_aib[1]
+        latency_total += layer_aib[2]
+        details.append({
+            "src_stack": src,
+            "dst_stack": dst,
+            "Q_bits": q_bits,
+            "wire_len_mm": wire_len_mm,
+            "wire_latency_ns": wire_latency_ns,
+            "aib_latency_ns": layer_aib[2],
+            "aib_result": layer_aib,
+        })
+
+    return {
+        "area_2_5d": area_total,
+        "energy_2_5d": energy_total,
+        "latency_2_5d": latency_total,
+        "details": details,
+    }
+
 def network_model(N_tier_real, N_stack_real, N_tile,N_tier,computing_data,placement_method,percent_router,chip_architect,tsvPitch,
-                  area_single_tile,result_list,result_dictionary,volt,fclk_noc,total_model_L,scale_factor, tiles_each_tier, routing_method, W2d):
+                  area_single_tile,result_list,result_dictionary,volt,fclk_noc,total_model_L,scale_factor, tiles_each_tier, routing_method, W2d,
+                  chiplet_floorplan=None, use_rapidchiplet_scheme2=False, rapidchiplet_module_path=None, enable_plots=False):
     # Network,3D NoC
     # area,latency,power
 
@@ -89,6 +272,7 @@ def network_model(N_tier_real, N_stack_real, N_tile,N_tier,computing_data,placem
     Q_2_5d=0
     layer_Q=[]
     layer_Q_2_5d=[]
+    transfers=[]
     layer_HOP_2d=[]
     layer_HOP_3d=[]
     hop2d_stack,hop3d_stack,Q_2d_stack,Q_3d_stack=[0]*N_stack_real,[0]*N_stack_real,[0]*N_stack_real,[0]*N_stack_real
@@ -107,7 +291,9 @@ def network_model(N_tier_real, N_stack_real, N_tile,N_tier,computing_data,placem
         
         if tile_total[i][0][3]!=tile_total[i+1][0][3]:
             Q_2_5d+=(tile_total[i][-1][3])*(len(tile_total[i+1])-1)
-            layer_Q_2_5d.append((tile_total[i][-1][3])*(len(tile_total[i+1])-1))
+            transfer_q_bits = (tile_total[i][-1][3])*(len(tile_total[i+1])-1)
+            layer_Q_2_5d.append(transfer_q_bits)
+            transfers.append((int(tile_total[i][0][3]), int(tile_total[i+1][0][3]), float(transfer_q_bits)))
             for x in range(len(tile_total[i])-1):
                 #import pdb;pdb.set_trace()
                 hop2d+=(abs(tile_total[i][x][0]-empty_tile_total[tile_total[i][x][2]][-1][0])+1)*2
@@ -201,20 +387,45 @@ def network_model(N_tier_real, N_stack_real, N_tile,N_tier,computing_data,placem
     single_router_area=total_router_area/(mesh_edge*mesh_edge*chiplet_num)
     edge_single_router=math.sqrt(single_router_area)
     layer_aib_list=[]
+    aib_out=[0,0,0]
     if (chip_architect=="H2_5D" or chip_architect=="M3_5D") and N_stack_real!=1:
-        aib_out=[0,0,0]
-        for i in range(len(layer_Q_2_5d)):
-            layer_aib=aib(layer_Q_2_5d[i]*1e-6/8, (edge_single_router+edge_single_tile)*mesh_edge, 1, volt)
-            layer_aib_list.append(layer_aib)
-            #area- layer_aib_list[idx][0] -mm2, energy- layer_aib_list[idx][1] -pJ, latency-layer_aib_list[idx][2]-ns
-            for i in range(len(aib_out)):
-                aib_out[i] += layer_aib[i]
-        area_2_5d=aib_out[0]
+        if chip_architect=="H2_5D" and use_rapidchiplet_scheme2 and chiplet_floorplan is not None:
+            floorplan_norm = _validate_and_normalize_floorplan(chiplet_floorplan, N_stack_real)
+            scheme2_res = compute_2p5d_aib_from_floorplan_and_transfers(
+                transfers,
+                floorplan_norm,
+                volt,
+                rapidchiplet_module_path=rapidchiplet_module_path,
+            )
+            for item in scheme2_res["details"]:
+                layer_aib = item["aib_result"]
+                layer_aib_list.append(layer_aib)
+                for idx in range(len(aib_out)):
+                    aib_out[idx] += layer_aib[idx]
+            area_2_5d = scheme2_res["area_2_5d"]
+        else:
+            for i in range(len(layer_Q_2_5d)):
+                layer_aib=aib(layer_Q_2_5d[i]*1e-6/8, (edge_single_router+edge_single_tile)*mesh_edge, 1, volt)
+                layer_aib_list.append(layer_aib)
+                #area- layer_aib_list[idx][0] -mm2, energy- layer_aib_list[idx][1] -pJ, latency-layer_aib_list[idx][2]-ns
+                for idx in range(len(aib_out)):
+                    aib_out[idx] += layer_aib[idx]
+            area_2_5d=aib_out[0]
     else:
         area_2_5d=0
 
     print("--------------network area report------------------------")
     print("single tile area",round(area_single_tile,5),"mm2")
+    if 'area_single_tile_legacy_last_mm2' in result_dictionary and 'area_single_tile_hw_mm2' in result_dictionary:
+        tile_area_mode = result_dictionary.get('tile_area_mode', 'unknown')
+        print("single tile area legacy_last", round(result_dictionary['area_single_tile_legacy_last_mm2'],5), "mm2")
+        print("single tile area hardware_only", round(result_dictionary['area_single_tile_hw_mm2'],5), "mm2")
+        print("tile area mode in use", tile_area_mode)
+    if 'total_leakage_active_only_pJ' in result_dictionary and 'total_leakage_installed_pJ' in result_dictionary:
+        leakage_mode = result_dictionary.get('leakage_mode', 'unknown')
+        print("total leakage active_only", round(result_dictionary['total_leakage_active_only_pJ'],5), "pJ")
+        print("total leakage installed", round(result_dictionary['total_leakage_installed_pJ'],5), "pJ")
+        print("leakage mode in use", leakage_mode)
     print("single router area",round(single_router_area,5),"mm2")
     print("edge length single router",round(edge_single_router,5),"mm") #mm
     print("edge length single tile",round(edge_single_tile,5),"mm") #mm
@@ -222,8 +433,13 @@ def network_model(N_tier_real, N_stack_real, N_tile,N_tier,computing_data,placem
     print("2.5d area", round(area_2_5d,5))
     print("---------------------------------------------------------")
 
-    result_list.append((edge_single_router+edge_single_tile)*(edge_single_router+edge_single_tile)*N_tile*N_stack_real+area_2_5d)
-    result_dictionary['chip area (mm2)'] = (edge_single_router+edge_single_tile)*(edge_single_router+edge_single_tile)*N_tile*N_stack_real+area_2_5d
+    if chiplet_floorplan is not None and chip_architect=="H2_5D":
+        floorplan_norm_for_area = _validate_and_normalize_floorplan(chiplet_floorplan, N_stack_real)
+        base_chip_area = sum(c["w"] * c["h"] for c in floorplan_norm_for_area["chiplet_by_stack"].values())
+    else:
+        base_chip_area = (edge_single_router+edge_single_tile)*(edge_single_router+edge_single_tile)*N_tile*N_stack_real
+    result_list.append(base_chip_area+area_2_5d)
+    result_dictionary['chip area (mm2)'] = base_chip_area+area_2_5d
 
     result_list.insert(8,W2d)
     result_list.insert(9,W3d)
@@ -390,44 +606,41 @@ def network_model(N_tier_real, N_stack_real, N_tile,N_tier,computing_data,placem
     result_list.append(Total_area_routers+Total_channel_area)
 
     #import pdb;pdb.set_trace()
-    fig = plt.figure(figsize=(20, 10))
-    start=0
-    nrows, ncols = 1, N_stack_real
-    axes = []
+    if enable_plots:
+        fig = plt.figure(figsize=(20, 10))
+        start=0
+        nrows, ncols = 1, N_stack_real
+        axes = []
 
-    for i in range(nrows):
-        for j in range(ncols):
-            ax = fig.add_subplot(nrows, ncols, i*ncols + j + 1, projection='3d')
-            axes.append(ax)
+        for i in range(nrows):
+            for j in range(ncols):
+                ax = fig.add_subplot(nrows, ncols, i*ncols + j + 1, projection='3d')
+                axes.append(ax)
     result_dictionary['2d_3d_router_area (mm2)'] = Total_area_routers+Total_channel_area
-    
-    for i, ax in enumerate(axes):
-        for item in empty_tile_total[start:start+N_tier_real]:
-            for tile in item:
-                count=False
-                x=0
-                idx=''
-                while not count and x<len(tile_total):
-                    for y in range(len(tile_total[x])-1):
-                        if not (tile-tile_total[x][y]).any():
-                            count=True
-                            break
-                    x+=1
-                if x<=len(tile_total)-1:
-                    #print(x-1, tile)
-                    #import pdb;pdb.set_trace()
-                    idx=x
-                create_tile(ax, *tile[:3], 0.5, 0.5, 0, 'blue',idx)
-        start+=N_tier_real
-        ax.set_axis_off()
-        ax.set_title(f'3D Stack {i+1}', fontsize=16) 
-        #import pdb;pdb.set_trace()
-    plt.savefig('./Results/tile_map.png')
-    plt.show()
-    plt.close()
 
+    if enable_plots:
+        for i, ax in enumerate(axes):
+            for item in empty_tile_total[start:start+N_tier_real]:
+                for tile in item:
+                    count=False
+                    x=0
+                    idx=''
+                    while not count and x<len(tile_total):
+                        for y in range(len(tile_total[x])-1):
+                            if not (tile-tile_total[x][y]).any():
+                                count=True
+                                break
+                        x+=1
+                    if x<=len(tile_total)-1:
+                        idx=x
+                    create_tile(ax, *tile[:3], 0.5, 0.5, 0, 'blue',idx)
+            start+=N_tier_real
+            ax.set_axis_off()
+            ax.set_title(f'3D Stack {i+1}', fontsize=16)
+        plt.savefig('./Results/tile_map.png')
+        plt.show()
+        plt.close()
 
-    
     return chiplet_num,tier_2d_hop_list_power,tier_3d_hop_list_power,single_router_area,mesh_edge,layer_aib_list,result_list
 
     
