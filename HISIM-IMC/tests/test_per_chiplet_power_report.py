@@ -19,12 +19,15 @@ def main():
         total_model_L_s = 1e-3
         p_leak_tile_w = 1e-3
 
+        active_leak_energy_by_stack_j = [2e-8, 3e-8]
         rows, total_power = _write_per_chiplet_power_report(
             out_csv,
             n_core_by_stack,
             dyn_energy_by_stack_j,
             total_model_L_s,
             p_leak_tile_w,
+            active_leak_energy_by_stack_j,
+            'active_only',
         )
 
         assert rows[0]['P_leak_W'] < rows[1]['P_leak_W']

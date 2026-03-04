@@ -122,7 +122,9 @@ class HiSimModel:
         use_rapidchiplet_scheme2 = True,
         rapidchiplet_module_path = None,
         packing_efficiency = 0.85,
-        area_violation_policy = "error"
+        area_violation_policy = "error",
+        tile_area_mode = "legacy_last",
+        leakage_mode = "active_only"
     ):
         if chip_architect == "H2_5D":
             self.placement_method = 1
@@ -165,6 +167,8 @@ class HiSimModel:
         self.rapidchiplet_module_path = rapidchiplet_module_path
         self.packing_efficiency = packing_efficiency
         self.area_violation_policy = area_violation_policy
+        self.tile_area_mode = tile_area_mode
+        self.leakage_mode = leakage_mode
         
         self.csv_header = [
                                 'freq_core (GHz)',
@@ -390,6 +394,7 @@ class HiSimModel:
 
         print("----------------------------------------------------","\n")
         print("start mapping ",self.ai_model,"\n")
+        print(f"Compute reporting modes: tile_area_mode={self.tile_area_mode}, leakage_mode={self.leakage_mode}")
 
         #---------------------------------------------------------------------#
         #                                                                     #
@@ -481,7 +486,9 @@ class HiSimModel:
                                             network_params,
                                             self.relu,
                                             n_core_by_stack=n_core_by_stack,
-                                            chiplet_defined_area_mm2=chiplet_defined_area_mm2
+                                            chiplet_defined_area_mm2=chiplet_defined_area_mm2,
+                                            tile_area_mode=self.tile_area_mode,
+                                            leakage_mode=self.leakage_mode
                                         )
 
         N_tier_real,computing_data,area_single_tile,volt,total_model_L,result_list,out_peripherial,A_peri = compute_results

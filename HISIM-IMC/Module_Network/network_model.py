@@ -416,6 +416,16 @@ def network_model(N_tier_real, N_stack_real, N_tile,N_tier,computing_data,placem
 
     print("--------------network area report------------------------")
     print("single tile area",round(area_single_tile,5),"mm2")
+    if 'area_single_tile_legacy_last_mm2' in result_dictionary and 'area_single_tile_hw_mm2' in result_dictionary:
+        tile_area_mode = result_dictionary.get('tile_area_mode', 'unknown')
+        print("single tile area legacy_last", round(result_dictionary['area_single_tile_legacy_last_mm2'],5), "mm2")
+        print("single tile area hardware_only", round(result_dictionary['area_single_tile_hw_mm2'],5), "mm2")
+        print("tile area mode in use", tile_area_mode)
+    if 'total_leakage_active_only_pJ' in result_dictionary and 'total_leakage_installed_pJ' in result_dictionary:
+        leakage_mode = result_dictionary.get('leakage_mode', 'unknown')
+        print("total leakage active_only", round(result_dictionary['total_leakage_active_only_pJ'],5), "pJ")
+        print("total leakage installed", round(result_dictionary['total_leakage_installed_pJ'],5), "pJ")
+        print("leakage mode in use", leakage_mode)
     print("single router area",round(single_router_area,5),"mm2")
     print("edge length single router",round(edge_single_router,5),"mm") #mm
     print("edge length single tile",round(edge_single_tile,5),"mm") #mm
